@@ -1,0 +1,8 @@
+# 复制此文件为 .dev.vars 并填写真实值
+# .dev.vars 已在 .gitignore 中忽略
+
+# 管理员 Token (用于管理前端和管理 API)
+ADMIN_TOKEN=change-me-to-a-strong-secret
+
+# 上传 Token (用于 Python 爬虫上传图片)
+UPLOAD_TOKEN=change-me-to-another-secret

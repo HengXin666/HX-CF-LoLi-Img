@@ -1,0 +1,16 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "hx-loli-img"
+main = "worker/src/index.js"
+compatibility_date = "2024-12-01"
+
+# R2 Binding
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "loli-img"
+
+# 开发环境变量在 .dev.vars 中配置（不提交到 git）
+# 生产环境变量在 Cloudflare Dashboard 中配置
+#
+# 需要配置的变量:
+# ADMIN_TOKEN - 管理员 API 密钥
+# UPLOAD_TOKEN - 上传 API 密钥
