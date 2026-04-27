@@ -197,6 +197,8 @@ body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background
       <input type="text" id="uploadTags" placeholder="genshin, hutao">
       <label>来源 URL</label>
       <input type="text" id="uploadSource" placeholder="https://...">
+      <label>AI 提示词（JSON 格式，可选）</label>
+      <textarea id="uploadPrompt" placeholder='{"positive": "1girl, ...", "negative": "...", "model": "..."}'></textarea>
     </div>
     <div class="modal-footer">
       <button class="btn btn-outline" onclick="closeModal('uploadModal')">取消</button>
@@ -462,6 +464,11 @@ async function doUpload() {
   btn.disabled = true; btn.textContent = "上传中...";
   const tags = document.getElementById("uploadTags").value.trim();
   const source = document.getElementById("uploadSource").value.trim();
+  const promptRaw = document.getElementById("uploadPrompt").value.trim();
+  let prompt = null;
+  if (promptRaw) {
+    try { prompt = JSON.parse(promptRaw); } catch { return toast("AI 提示词 JSON 格式错误", "error"); }
+  }
 
   let ok = 0, fail = 0;
   for (const f of uploadFiles) {
@@ -470,6 +477,7 @@ async function doUpload() {
       fd.append("file", f);
       if (tags) fd.append("tags", tags);
       if (source) fd.append("source", source);
+      if (prompt) fd.append("prompt", JSON.stringify(prompt));
       // 尝试用 Image 获取尺寸
       const dim = await getImageDimensions(f);
       if (dim) { fd.append("width", dim.width); fd.append("height", dim.height); }
