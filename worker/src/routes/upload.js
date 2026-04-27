@@ -1,5 +1,5 @@
 import { checkAuth, error, json, nanoid, getMime } from "../utils.js";
-import { addImage, loadManifest, invalidateCache } from "../meta.js";
+import { addImage } from "../meta.js";
 
 /**
  * POST /api/upload
@@ -91,8 +91,8 @@ export async function handleUpload(request, env) {
     created_at: new Date().toISOString(),
   };
 
-  // 写入索引（manifest + item + shard）
-  await addImage(env.BUCKET, imageData);
+  // 写入 D1 数据库
+  await addImage(env.DB, imageData);
 
   return json({ ok: true, image: imageData }, 201);
 }
@@ -150,7 +150,7 @@ export async function handleBatchRegister(request, env) {
       created_at: new Date().toISOString(),
     };
 
-    await addImage(env.BUCKET, imageData);
+    await addImage(env.DB, imageData);
     results.push(imageData);
   }
 

@@ -1,534 +1,530 @@
 /**
- * 元数据索引管理 v2 — 三级索引 + 全局缓存
+ * 元数据管理 — D1 SQL 数据库
  *
- * 存储结构:
- *
- * _meta/manifest.json (轻量清单, ~1-5KB 即使万张图)
- * {
- *   "version": 2,
- *   "total": 1234,
- *   "shard_size": 500,
- *   "shard_count": 3,
- *   "ids": ["abc","def",...],           // 所有 ID（用于纯随机，无需加载详情）
- *   "by_orientation": {                  // 预计算的分桶 → ID 列表
- *     "landscape": ["abc","ghi",...],
- *     "portrait": ["def",...],
- *     "square": [...],
- *     "unknown": [...]
- *   },
- *   "by_tag": {                          // 倒排索引 → tag: ID[]
- *     "genshin": ["abc","def"],
- *     "hutao": ["abc"]
- *   },
- *   "with_prompt": ["abc",...],          // 有提示词的 ID
- *   "updated_at": "..."
- * }
- *
- * _meta/items/{id}.json (单条详情, ~200-500B)
- * {
- *   "id","key","tags","width","height","orientation",
- *   "size","mime","prompt","source","uploader","created_at"
- * }
- *
- * _meta/shards/shard-0.json (分片, 管理列表用, 每片最多 500 条)
- * { "images": { "<id>": {...}, ... } }
+ * 表结构:
+ *   images      — 图片主表（id, key, width, height, orientation, size, mime, prompt, source, uploader, created_at）
+ *   image_tags  — 标签关联表（image_id, tag）
  *
  * 性能特征:
- * - /api/random (无筛选) → 读 manifest (几KB) + 读 N 个 items → O(1) R2 读取
- * - /api/random?tag=x → 读 manifest → 从倒排索引取 ID 集 → 取交集 → 随机 + 读 items
- * - /i/{id}           → 读 items/{id}.json → O(1) R2 读取
- * - 管理列表           → 读 manifest + 1 个 shard → 按需分页
- * - 上传/删除          → 读 manifest → 更新 manifest + items + shard → 写回
+ *   /api/random (无筛选)     → SELECT ... ORDER BY RANDOM() LIMIT N  → 1 次 D1 查询
+ *   /api/random?tag=x        → JOIN image_tags + WHERE tag IN (...)   → 1 次 D1 查询
+ *   /i/{id}                  → SELECT ... WHERE id = ?                → 1 次 D1 查询
+ *   上传/删除                → INSERT/DELETE                          → 1-2 次 D1 写入
+ *   管理列表                 → SELECT + LIMIT/OFFSET                  → 1 次 D1 查询
  *
- * CF Worker 免费版 CPU 10ms，本方案公开 API 耗时 < 3ms
+ * 对比旧方案:
+ *   - 无并发竞态（D1 事务保证）
+ *   - 数据实时一致（无 30s 缓存延迟）
+ *   - 写入 O(1)（不再全量读写 manifest）
+ *   - R2 只存图片文件，不再存元数据 JSON
  */
 
-const MANIFEST_KEY = "_meta/manifest.json";
-const SHARD_SIZE = 500;
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS images (
+  id TEXT PRIMARY KEY,
+  key TEXT NOT NULL UNIQUE,
+  width INTEGER DEFAULT 0,
+  height INTEGER DEFAULT 0,
+  orientation TEXT DEFAULT 'unknown',
+  size INTEGER DEFAULT 0,
+  mime TEXT DEFAULT '',
+  prompt TEXT,
+  source TEXT DEFAULT '',
+  uploader TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
 
-// ========== 全局内存缓存（同一个 Worker isolate 内复用） ==========
+CREATE TABLE IF NOT EXISTS image_tags (
+  image_id TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  PRIMARY KEY (image_id, tag),
+  FOREIGN KEY (image_id) REFERENCES images(id) ON DELETE CASCADE
+);
 
-let _manifestCache = null;
-let _manifestCacheTime = 0;
-const CACHE_TTL_MS = 30_000; // 30 秒缓存
+CREATE INDEX IF NOT EXISTS idx_image_tags_tag ON image_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_images_orientation ON images(orientation);
+CREATE INDEX IF NOT EXISTS idx_images_created_at ON images(created_at);
+`;
 
-function isManifestCacheValid() {
-  return _manifestCache && (Date.now() - _manifestCacheTime < CACHE_TTL_MS);
-}
-
-export function invalidateCache() {
-  _manifestCache = null;
-  _manifestCacheTime = 0;
-}
-
-// ========== Manifest（轻量清单） ==========
-
-function emptyManifest() {
-  return {
-    version: 2,
-    total: 0,
-    shard_size: SHARD_SIZE,
-    shard_count: 0,
-    ids: [],
-    by_orientation: { landscape: [], portrait: [], square: [], unknown: [] },
-    by_tag: {},
-    with_prompt: [],
-    updated_at: new Date().toISOString(),
-  };
-}
-
-export async function loadManifest(bucket) {
-  if (isManifestCacheValid()) return _manifestCache;
-
-  const obj = await bucket.get(MANIFEST_KEY);
-  if (!obj) {
-    const m = emptyManifest();
-    _manifestCache = m;
-    _manifestCacheTime = Date.now();
-    return m;
+/**
+ * 初始化数据库表（幂等，可重复调用）
+ */
+export async function initDB(db) {
+  const statements = SCHEMA_SQL
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const sql of statements) {
+    await db.prepare(sql).run();
   }
-  const m = await obj.json();
-  _manifestCache = m;
-  _manifestCacheTime = Date.now();
-  return m;
 }
 
-async function saveManifest(bucket, manifest) {
-  manifest.updated_at = new Date().toISOString();
-  manifest.total = manifest.ids.length;
-  manifest.shard_count = Math.ceil(manifest.total / SHARD_SIZE);
-  await bucket.put(MANIFEST_KEY, JSON.stringify(manifest), {
-    httpMetadata: { contentType: "application/json" },
-  });
-  _manifestCache = manifest;
-  _manifestCacheTime = Date.now();
-}
+/**
+ * 添加图片
+ */
+export async function addImage(db, imageData) {
+  const promptStr = imageData.prompt ? JSON.stringify(imageData.prompt) : null;
 
-// ========== Item（单条详情） ==========
-
-function itemKey(id) {
-  return `_meta/items/${id}.json`;
-}
-
-export async function loadItem(bucket, id) {
-  const obj = await bucket.get(itemKey(id));
-  if (!obj) return null;
-  return obj.json();
-}
-
-async function saveItem(bucket, imageData) {
-  await bucket.put(itemKey(imageData.id), JSON.stringify(imageData), {
-    httpMetadata: { contentType: "application/json" },
-  });
-}
-
-async function deleteItemFile(bucket, id) {
-  await bucket.delete(itemKey(id));
-}
-
-// ========== Shard（管理分片） ==========
-
-function shardKey(index) {
-  return `_meta/shards/shard-${index}.json`;
-}
-
-async function loadShard(bucket, index) {
-  const obj = await bucket.get(shardKey(index));
-  if (!obj) return { images: {} };
-  return obj.json();
-}
-
-async function saveShard(bucket, index, shard) {
-  await bucket.put(shardKey(index), JSON.stringify(shard), {
-    httpMetadata: { contentType: "application/json" },
-  });
-}
-
-function getShardIndex(manifest, id) {
-  const pos = manifest.ids.indexOf(id);
-  if (pos === -1) return -1;
-  return Math.floor(pos / SHARD_SIZE);
-}
-
-// ========== 写操作 ==========
-
-/** 添加图片 */
-export async function addImage(bucket, imageData) {
-  const manifest = await loadManifest(bucket);
-
-  // 更新 manifest 索引
-  manifest.ids.push(imageData.id);
-
-  const orient = imageData.orientation || "unknown";
-  if (manifest.by_orientation[orient]) {
-    manifest.by_orientation[orient].push(imageData.id);
-  }
-
-  if (imageData.tags) {
-    for (const tag of imageData.tags) {
-      if (!manifest.by_tag[tag]) manifest.by_tag[tag] = [];
-      manifest.by_tag[tag].push(imageData.id);
-    }
-  }
-
-  if (imageData.prompt) {
-    manifest.with_prompt.push(imageData.id);
-  }
-
-  // 写 item 文件
-  await saveItem(bucket, imageData);
-
-  // 写入对应 shard
-  const shardIdx = Math.floor((manifest.ids.length - 1) / SHARD_SIZE);
-  const shard = await loadShard(bucket, shardIdx);
-  shard.images[imageData.id] = imageData;
-  await saveShard(bucket, shardIdx, shard);
-
-  // 保存 manifest
-  await saveManifest(bucket, manifest);
+  await db.batch([
+    db.prepare(
+      `INSERT INTO images (id, key, width, height, orientation, size, mime, prompt, source, uploader, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      imageData.id,
+      imageData.key,
+      imageData.width || 0,
+      imageData.height || 0,
+      imageData.orientation || "unknown",
+      imageData.size || 0,
+      imageData.mime || "",
+      promptStr,
+      imageData.source || "",
+      imageData.uploader || "",
+      imageData.created_at
+    ),
+    ...(imageData.tags || []).map((tag) =>
+      db.prepare("INSERT INTO image_tags (image_id, tag) VALUES (?, ?)").bind(imageData.id, tag)
+    ),
+  ]);
 
   return imageData;
 }
 
-/** 删除图片（同时删除 R2 图片文件） */
-export async function deleteImage(bucket, id) {
-  const manifest = await loadManifest(bucket);
-  const pos = manifest.ids.indexOf(id);
-  if (pos === -1) return null;
-
-  // 先读 item 获取详情
-  const img = await loadItem(bucket, id);
-  if (!img) return null;
-
-  // 从 shard 中移除
-  const shardIdx = Math.floor(pos / SHARD_SIZE);
-  const shard = await loadShard(bucket, shardIdx);
-  delete shard.images[id];
-  await saveShard(bucket, shardIdx, shard);
-
-  // 从 manifest 中移除
-  manifest.ids.splice(pos, 1);
-  const orient = img.orientation || "unknown";
-  if (manifest.by_orientation[orient]) {
-    const oi = manifest.by_orientation[orient].indexOf(id);
-    if (oi !== -1) manifest.by_orientation[orient].splice(oi, 1);
-  }
-  if (img.tags) {
-    for (const tag of img.tags) {
-      if (manifest.by_tag[tag]) {
-        const ti = manifest.by_tag[tag].indexOf(id);
-        if (ti !== -1) manifest.by_tag[tag].splice(ti, 1);
-        if (manifest.by_tag[tag].length === 0) delete manifest.by_tag[tag];
-      }
-    }
-  }
-  if (img.prompt) {
-    const pi = manifest.with_prompt.indexOf(id);
-    if (pi !== -1) manifest.with_prompt.splice(pi, 1);
-  }
-
-  // 删除 R2 文件
-  await bucket.delete([img.key, itemKey(id)]);
-
-  await saveManifest(bucket, manifest);
-  return img;
+/**
+ * 加载单条图片详情
+ */
+export async function loadItem(db, id) {
+  const row = await db.prepare("SELECT * FROM images WHERE id = ?").bind(id).first();
+  if (!row) return null;
+  return await enrichRow(db, row);
 }
-
-/** 批量删除 */
-export async function deleteImages(bucket, ids) {
-  const manifest = await loadManifest(bucket);
-  const deleted = [];
-  const r2KeysToDelete = [];
-  const affectedShards = new Map(); // shardIdx -> shard
-
-  for (const id of ids) {
-    const pos = manifest.ids.indexOf(id);
-    if (pos === -1) continue;
-
-    const img = await loadItem(bucket, id);
-    if (!img) continue;
-
-    // 收集需要删除的 R2 key
-    r2KeysToDelete.push(img.key, itemKey(id));
-    deleted.push(img);
-
-    // 从 shard 中移除
-    const shardIdx = Math.floor(pos / SHARD_SIZE);
-    if (!affectedShards.has(shardIdx)) {
-      affectedShards.set(shardIdx, await loadShard(bucket, shardIdx));
-    }
-    delete affectedShards.get(shardIdx).images[id];
-
-    // 从 manifest 中移除（标记为 null，之后 filter）
-    manifest.ids[pos] = null;
-
-    const orient = img.orientation || "unknown";
-    if (manifest.by_orientation[orient]) {
-      const oi = manifest.by_orientation[orient].indexOf(id);
-      if (oi !== -1) manifest.by_orientation[orient].splice(oi, 1);
-    }
-    if (img.tags) {
-      for (const tag of img.tags) {
-        if (manifest.by_tag[tag]) {
-          const ti = manifest.by_tag[tag].indexOf(id);
-          if (ti !== -1) manifest.by_tag[tag].splice(ti, 1);
-          if (manifest.by_tag[tag].length === 0) delete manifest.by_tag[tag];
-        }
-      }
-    }
-    if (img.prompt) {
-      const pi = manifest.with_prompt.indexOf(id);
-      if (pi !== -1) manifest.with_prompt.splice(pi, 1);
-    }
-  }
-
-  manifest.ids = manifest.ids.filter((x) => x !== null);
-
-  if (r2KeysToDelete.length > 0) {
-    // R2 批量删除，每次最多 1000
-    for (let i = 0; i < r2KeysToDelete.length; i += 1000) {
-      await bucket.delete(r2KeysToDelete.slice(i, i + 1000));
-    }
-  }
-
-  // 保存受影响的 shards
-  for (const [idx, shard] of affectedShards) {
-    await saveShard(bucket, idx, shard);
-  }
-
-  await saveManifest(bucket, manifest);
-  return deleted;
-}
-
-/** 更新图片元数据 */
-export async function updateImage(bucket, id, updates) {
-  const manifest = await loadManifest(bucket);
-  if (!manifest.ids.includes(id)) return null;
-
-  const img = await loadItem(bucket, id);
-  if (!img) return null;
-
-  const oldTags = img.tags || [];
-  const hadPrompt = img.prompt != null;
-
-  // 应用更新
-  const allowed = ["tags", "prompt", "source", "uploader"];
-  for (const key of allowed) {
-    if (updates[key] !== undefined) img[key] = updates[key];
-  }
-
-  // 同步 manifest 中的倒排索引
-  const newTags = img.tags || [];
-  const hasPromptNow = img.prompt != null;
-
-  // 处理 tags 变更
-  const removedTags = oldTags.filter((t) => !newTags.includes(t));
-  const addedTags = newTags.filter((t) => !oldTags.includes(t));
-
-  for (const tag of removedTags) {
-    if (manifest.by_tag[tag]) {
-      const ti = manifest.by_tag[tag].indexOf(id);
-      if (ti !== -1) manifest.by_tag[tag].splice(ti, 1);
-      if (manifest.by_tag[tag].length === 0) delete manifest.by_tag[tag];
-    }
-  }
-  for (const tag of addedTags) {
-    if (!manifest.by_tag[tag]) manifest.by_tag[tag] = [];
-    manifest.by_tag[tag].push(id);
-  }
-
-  // 处理 prompt 变更
-  if (!hadPrompt && hasPromptNow) {
-    manifest.with_prompt.push(id);
-  } else if (hadPrompt && !hasPromptNow) {
-    const pi = manifest.with_prompt.indexOf(id);
-    if (pi !== -1) manifest.with_prompt.splice(pi, 1);
-  }
-
-  // 保存 item
-  await saveItem(bucket, img);
-
-  // 更新 shard
-  const pos = manifest.ids.indexOf(id);
-  const shardIdx = Math.floor(pos / SHARD_SIZE);
-  const shard = await loadShard(bucket, shardIdx);
-  shard.images[id] = img;
-  await saveShard(bucket, shardIdx, shard);
-
-  await saveManifest(bucket, manifest);
-  return img;
-}
-
-// ========== 查询操作 ==========
 
 /**
- * 基于 manifest 倒排索引快速筛选 ID 集合
- * 不需要加载任何详情数据！
- *
- * @returns {string[]} 匹配的 ID 列表
+ * 批量加载图片详情
  */
-export function queryIds(manifest, filter = {}) {
-  let candidateIds = null; // null = 全部
+export async function loadItems(db, ids) {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  const { results } = await db
+    .prepare(`SELECT * FROM images WHERE id IN (${placeholders})`)
+    .bind(...ids)
+    .all();
+  return enrichRows(db, results);
+}
 
-  // 标签筛选（AND 关系，用倒排索引取交集）
-  if (filter.tags && filter.tags.length > 0) {
-    for (const tag of filter.tags) {
-      const tagIds = manifest.by_tag[tag];
-      if (!tagIds || tagIds.length === 0) return []; // 某个 tag 无结果 → 交集为空
-      const tagSet = new Set(tagIds);
-      if (candidateIds === null) {
-        candidateIds = [...tagSet];
-      } else {
-        candidateIds = candidateIds.filter((id) => tagSet.has(id));
-      }
-      if (candidateIds.length === 0) return [];
+/**
+ * 删除图片（返回被删除的图片信息，不删 R2 文件，由调用方处理）
+ */
+export async function deleteImage(db, id) {
+  const img = await loadItem(db, id);
+  if (!img) return null;
+
+  await db.batch([
+    db.prepare("DELETE FROM image_tags WHERE image_id = ?").bind(id),
+    db.prepare("DELETE FROM images WHERE id = ?").bind(id),
+  ]);
+
+  return img;
+}
+
+/**
+ * 批量删除图片
+ */
+export async function deleteImages(db, ids) {
+  if (ids.length === 0) return [];
+
+  const items = await loadItems(db, ids);
+  if (items.length === 0) return [];
+
+  const existingIds = items.map((i) => i.id);
+  const placeholders = existingIds.map(() => "?").join(",");
+
+  await db.batch([
+    db.prepare(`DELETE FROM image_tags WHERE image_id IN (${placeholders})`).bind(...existingIds),
+    db.prepare(`DELETE FROM images WHERE id IN (${placeholders})`).bind(...existingIds),
+  ]);
+
+  return items;
+}
+
+/**
+ * 更新图片元数据
+ */
+export async function updateImage(db, id, updates) {
+  const img = await loadItem(db, id);
+  if (!img) return null;
+
+  const stmts = [];
+  const allowed = ["prompt", "source", "uploader"];
+
+  for (const key of allowed) {
+    if (updates[key] !== undefined) {
+      const val = key === "prompt" && updates[key] ? JSON.stringify(updates[key]) : updates[key];
+      stmts.push(db.prepare(`UPDATE images SET ${key} = ? WHERE id = ?`).bind(val, id));
     }
+  }
+
+  // 标签更新：删除旧的，插入新的
+  if (updates.tags !== undefined) {
+    stmts.push(db.prepare("DELETE FROM image_tags WHERE image_id = ?").bind(id));
+    for (const tag of updates.tags) {
+      stmts.push(db.prepare("INSERT INTO image_tags (image_id, tag) VALUES (?, ?)").bind(id, tag));
+    }
+  }
+
+  if (stmts.length > 0) {
+    await db.batch(stmts);
+  }
+
+  return loadItem(db, id);
+}
+
+/**
+ * 随机查询图片 ID
+ *
+ * 性能: 单次 D1 查询，利用 SQL 索引
+ * 无筛选: SELECT id FROM images ORDER BY RANDOM() LIMIT N
+ * 有筛选: JOIN image_tags + WHERE 条件 + ORDER BY RANDOM()
+ */
+export async function queryRandom(db, filter = {}, count = 1) {
+  const conditions = [];
+  const binds = [];
+
+  let needTagJoin = false;
+
+  // 标签筛选（AND 关系：同时拥有所有标签）
+  if (filter.tags && filter.tags.length > 0) {
+    needTagJoin = true;
+    const tagPlaceholders = filter.tags.map(() => "?").join(",");
+    conditions.push(`t.tag IN (${tagPlaceholders})`);
+    binds.push(...filter.tags);
   }
 
   // 方向筛选
   if (filter.orientation) {
-    const orientIds = manifest.by_orientation[filter.orientation] || [];
-    if (orientIds.length === 0) return [];
-    const orientSet = new Set(orientIds);
-    if (candidateIds === null) {
-      candidateIds = [...orientSet];
-    } else {
-      candidateIds = candidateIds.filter((id) => orientSet.has(id));
-    }
-    if (candidateIds.length === 0) return [];
+    conditions.push("i.orientation = ?");
+    binds.push(filter.orientation);
   }
 
   // 提示词筛选
   if (filter.hasPrompt === true) {
-    const promptSet = new Set(manifest.with_prompt);
-    if (candidateIds === null) {
-      candidateIds = [...promptSet];
-    } else {
-      candidateIds = candidateIds.filter((id) => promptSet.has(id));
-    }
+    conditions.push("i.prompt IS NOT NULL");
   } else if (filter.hasPrompt === false) {
-    const promptSet = new Set(manifest.with_prompt);
-    if (candidateIds === null) {
-      candidateIds = manifest.ids.filter((id) => !promptSet.has(id));
-    } else {
-      candidateIds = candidateIds.filter((id) => !promptSet.has(id));
-    }
+    conditions.push("i.prompt IS NULL");
   }
 
-  // 如果还没有筛选过，用全部 ID
-  if (candidateIds === null) {
-    candidateIds = manifest.ids;
+  // 尺寸筛选
+  if (filter.minWidth) {
+    conditions.push("i.width >= ?");
+    binds.push(filter.minWidth);
+  }
+  if (filter.minHeight) {
+    conditions.push("i.height >= ?");
+    binds.push(filter.minHeight);
+  }
+  if (filter.maxWidth) {
+    conditions.push("i.width <= ?");
+    binds.push(filter.maxWidth);
+  }
+  if (filter.maxHeight) {
+    conditions.push("i.height <= ?");
+    binds.push(filter.maxHeight);
   }
 
-  return candidateIds;
+  let sql;
+  if (needTagJoin) {
+    const tagCount = filter.tags.length;
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    // HAVING COUNT(DISTINCT t.tag) = tagCount 确保 AND 语义
+    sql = `
+      SELECT i.id FROM images i
+      JOIN image_tags t ON i.id = t.image_id
+      ${where}
+      GROUP BY i.id
+      HAVING COUNT(DISTINCT t.tag) = ?
+      ORDER BY RANDOM()
+      LIMIT ?
+    `;
+    binds.push(tagCount, count);
+  } else {
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    sql = `SELECT i.id FROM images i ${where} ORDER BY RANDOM() LIMIT ?`;
+    binds.push(count);
+  }
+
+  const { results } = await db.prepare(sql).bind(...binds).all();
+  return results.map((r) => r.id);
 }
 
 /**
- * 快速筛选后还需要基于尺寸进一步过滤时，按需加载 items
- * 只有传了尺寸参数才需要这一步
+ * 统计匹配筛选条件的总数
  */
-export async function queryWithDimensions(bucket, ids, filter) {
-  const needsDimFilter =
-    filter.minWidth || filter.minHeight || filter.maxWidth || filter.maxHeight;
-  if (!needsDimFilter) return ids;
+export async function queryCount(db, filter = {}) {
+  const conditions = [];
+  const binds = [];
+  let needTagJoin = false;
 
-  // 批量加载详情（并发请求，最多同时 20 个）
-  const BATCH = 20;
-  const result = [];
-  for (let i = 0; i < ids.length; i += BATCH) {
-    const batch = ids.slice(i, i + BATCH);
-    const items = await Promise.all(batch.map((id) => loadItem(bucket, id)));
-    for (const item of items) {
-      if (!item) continue;
-      if (filter.minWidth && item.width < filter.minWidth) continue;
-      if (filter.minHeight && item.height < filter.minHeight) continue;
-      if (filter.maxWidth && item.width > filter.maxWidth) continue;
-      if (filter.maxHeight && item.height > filter.maxHeight) continue;
-      result.push(item.id);
-    }
+  if (filter.tags && filter.tags.length > 0) {
+    needTagJoin = true;
+    const tagPlaceholders = filter.tags.map(() => "?").join(",");
+    conditions.push(`t.tag IN (${tagPlaceholders})`);
+    binds.push(...filter.tags);
   }
-  return result;
-}
-
-/** 从 ID 列表中随机取 n 个（不重复） */
-export function pickRandomIds(ids, count = 1) {
-  if (ids.length === 0) return [];
-  const n = Math.min(count, ids.length);
-  const arr = [...ids];
-  for (let i = 0; i < n; i++) {
-    const j = i + Math.floor(Math.random() * (arr.length - i));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+  if (filter.orientation) {
+    conditions.push("i.orientation = ?");
+    binds.push(filter.orientation);
   }
-  return arr.slice(0, n);
-}
+  if (filter.hasPrompt === true) {
+    conditions.push("i.prompt IS NOT NULL");
+  } else if (filter.hasPrompt === false) {
+    conditions.push("i.prompt IS NULL");
+  }
+  if (filter.minWidth) { conditions.push("i.width >= ?"); binds.push(filter.minWidth); }
+  if (filter.minHeight) { conditions.push("i.height >= ?"); binds.push(filter.minHeight); }
+  if (filter.maxWidth) { conditions.push("i.width <= ?"); binds.push(filter.maxWidth); }
+  if (filter.maxHeight) { conditions.push("i.height <= ?"); binds.push(filter.maxHeight); }
 
-/** 批量加载多个 item 详情（并发） */
-export async function loadItems(bucket, ids) {
-  const items = await Promise.all(ids.map((id) => loadItem(bucket, id)));
-  return items.filter(Boolean);
-}
+  let sql;
+  if (needTagJoin) {
+    const tagCount = filter.tags.length;
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    sql = `
+      SELECT COUNT(*) as cnt FROM (
+        SELECT i.id FROM images i
+        JOIN image_tags t ON i.id = t.image_id
+        ${where}
+        GROUP BY i.id
+        HAVING COUNT(DISTINCT t.tag) = ?
+      )
+    `;
+    binds.push(tagCount);
+  } else {
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    sql = `SELECT COUNT(*) as cnt FROM images i ${where}`;
+  }
 
-/** 加载一个 shard 的图片列表（管理页分页用） */
-export async function loadShardPage(bucket, shardIdx) {
-  const shard = await loadShard(bucket, shardIdx);
-  return Object.values(shard.images);
+  const row = await db.prepare(sql).bind(...binds).first();
+  return row?.cnt || 0;
 }
-
-// ========== 兼容迁移 ==========
 
 /**
- * 从 v1 单文件索引迁移到 v2
- * 管理 API 提供一个 POST /api/admin/migrate 调用
+ * 管理列表查询（分页 + 筛选 + 搜索）
  */
-export async function migrateV1toV2(bucket) {
-  const oldObj = await bucket.get("_meta/index.json");
-  if (!oldObj) return { migrated: 0 };
+export async function queryList(db, { page = 1, perPage = 20, tag, orientation, search } = {}) {
+  const conditions = [];
+  const binds = [];
+  let needTagJoin = false;
 
-  const oldIndex = await oldObj.json();
-  if (!oldIndex.images) return { migrated: 0 };
+  if (tag) {
+    needTagJoin = true;
+    conditions.push("t.tag = ?");
+    binds.push(tag.toLowerCase());
+  }
+  if (orientation) {
+    conditions.push("i.orientation = ?");
+    binds.push(orientation);
+  }
+  if (search) {
+    const q = `%${search.toLowerCase()}%`;
+    // 搜索 id/source/uploader 或标签名
+    conditions.push(
+      `(i.id LIKE ? OR i.source LIKE ? OR i.uploader LIKE ? OR i.id IN (SELECT image_id FROM image_tags WHERE tag LIKE ?))`
+    );
+    binds.push(q, q, q, q);
+  }
 
-  const images = Object.values(oldIndex.images);
-  const manifest = emptyManifest();
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const offset = (page - 1) * perPage;
 
-  // 按创建时间排序
-  images.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+  let countSql, dataSql;
 
-  const shards = {};
-  for (let i = 0; i < images.length; i++) {
-    const img = images[i];
-    manifest.ids.push(img.id);
+  if (needTagJoin) {
+    countSql = `SELECT COUNT(DISTINCT i.id) as cnt FROM images i JOIN image_tags t ON i.id = t.image_id ${where}`;
+    dataSql = `
+      SELECT DISTINCT i.* FROM images i
+      JOIN image_tags t ON i.id = t.image_id
+      ${where}
+      ORDER BY i.created_at DESC
+      LIMIT ? OFFSET ?
+    `;
+  } else {
+    countSql = `SELECT COUNT(*) as cnt FROM images i ${where}`;
+    dataSql = `SELECT i.* FROM images i ${where} ORDER BY i.created_at DESC LIMIT ? OFFSET ?`;
+  }
 
-    const orient = img.orientation || "unknown";
-    if (manifest.by_orientation[orient]) {
-      manifest.by_orientation[orient].push(img.id);
+  const [countResult, dataResult] = await db.batch([
+    db.prepare(countSql).bind(...binds),
+    db.prepare(dataSql).bind(...binds, perPage, offset),
+  ]);
+
+  const total = countResult.results[0]?.cnt || 0;
+  const images = await enrichRows(db, dataResult.results);
+
+  return { total, page, perPage, images };
+}
+
+/**
+ * 获取所有标签及其计数
+ */
+export async function listTags(db) {
+  const { results } = await db
+    .prepare("SELECT tag, COUNT(*) as count FROM image_tags GROUP BY tag ORDER BY count DESC")
+    .all();
+  return results.map((r) => ({ name: r.tag, count: r.count }));
+}
+
+/**
+ * 获取统计信息
+ */
+export async function getStats(db) {
+  const [totalResult, orientResult, promptResult, tagResult] = await db.batch([
+    db.prepare("SELECT COUNT(*) as cnt FROM images"),
+    db.prepare("SELECT orientation, COUNT(*) as cnt FROM images GROUP BY orientation"),
+    db.prepare("SELECT COUNT(*) as cnt FROM images WHERE prompt IS NOT NULL"),
+    db.prepare("SELECT COUNT(DISTINCT tag) as cnt FROM image_tags"),
+  ]);
+
+  const orientations = { landscape: 0, portrait: 0, square: 0, unknown: 0 };
+  for (const row of orientResult.results) {
+    if (orientations.hasOwnProperty(row.orientation)) {
+      orientations[row.orientation] = row.cnt;
     }
-    if (img.tags) {
-      for (const tag of img.tags) {
-        if (!manifest.by_tag[tag]) manifest.by_tag[tag] = [];
-        manifest.by_tag[tag].push(img.id);
+  }
+
+  return {
+    total_images: totalResult.results[0]?.cnt || 0,
+    orientations,
+    with_prompt: promptResult.results[0]?.cnt || 0,
+    unique_tags: tagResult.results[0]?.cnt || 0,
+  };
+}
+
+/**
+ * 将 DB row 转换为完整的图片对象（附带 tags）
+ */
+async function enrichRow(db, row) {
+  const { results: tagRows } = await db
+    .prepare("SELECT tag FROM image_tags WHERE image_id = ?")
+    .bind(row.id)
+    .all();
+
+  return {
+    id: row.id,
+    key: row.key,
+    tags: tagRows.map((r) => r.tag),
+    width: row.width,
+    height: row.height,
+    orientation: row.orientation,
+    size: row.size,
+    mime: row.mime,
+    prompt: row.prompt ? JSON.parse(row.prompt) : null,
+    source: row.source,
+    uploader: row.uploader,
+    created_at: row.created_at,
+  };
+}
+
+/**
+ * 批量 enrichRow（减少 D1 查询次数）
+ */
+async function enrichRows(db, rows) {
+  if (rows.length === 0) return [];
+  const ids = rows.map((r) => r.id);
+  const placeholders = ids.map(() => "?").join(",");
+  const { results: allTags } = await db
+    .prepare(`SELECT image_id, tag FROM image_tags WHERE image_id IN (${placeholders})`)
+    .bind(...ids)
+    .all();
+
+  const tagMap = {};
+  for (const t of allTags) {
+    if (!tagMap[t.image_id]) tagMap[t.image_id] = [];
+    tagMap[t.image_id].push(t.tag);
+  }
+
+  return rows.map((row) => ({
+    id: row.id,
+    key: row.key,
+    tags: tagMap[row.id] || [],
+    width: row.width,
+    height: row.height,
+    orientation: row.orientation,
+    size: row.size,
+    mime: row.mime,
+    prompt: row.prompt ? JSON.parse(row.prompt) : null,
+    source: row.source,
+    uploader: row.uploader,
+    created_at: row.created_at,
+  }));
+}
+
+/**
+ * 从 R2 旧版 manifest 迁移到 D1
+ * 读取 R2 中的 _meta/manifest.json + _meta/items/*.json，写入 D1
+ */
+export async function migrateR2toD1(bucket, db) {
+  await initDB(db);
+
+  // 尝试读取旧 manifest
+  const manifestObj = await bucket.get("_meta/manifest.json");
+  if (!manifestObj) {
+    // 尝试 v1 格式
+    const v1Obj = await bucket.get("_meta/index.json");
+    if (!v1Obj) return { migrated: 0, message: "No R2 metadata found" };
+    const v1Index = await v1Obj.json();
+    if (!v1Index.images) return { migrated: 0, message: "No images in v1 index" };
+
+    const images = Object.values(v1Index.images);
+    let migrated = 0;
+    for (const img of images) {
+      try {
+        await addImage(db, img);
+        migrated++;
+      } catch (e) {
+        console.error(`Failed to migrate ${img.id}:`, e.message);
       }
     }
-    if (img.prompt) manifest.with_prompt.push(img.id);
-
-    // 写 item 文件
-    await saveItem(bucket, img);
-
-    // 分片
-    const shardIdx = Math.floor(i / SHARD_SIZE);
-    if (!shards[shardIdx]) shards[shardIdx] = { images: {} };
-    shards[shardIdx].images[img.id] = img;
+    return { migrated, message: `Migrated ${migrated} images from v1 index` };
   }
 
-  // 写所有 shards
-  for (const [idx, shard] of Object.entries(shards)) {
-    await saveShard(bucket, parseInt(idx), shard);
+  const manifest = await manifestObj.json();
+  const ids = manifest.ids || [];
+  let migrated = 0;
+  let failed = 0;
+
+  // 逐个读取 item 文件并写入 D1
+  const BATCH = 10;
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const batch = ids.slice(i, i + BATCH);
+    const items = await Promise.all(
+      batch.map(async (id) => {
+        const obj = await bucket.get(`_meta/items/${id}.json`);
+        if (!obj) return null;
+        return obj.json();
+      })
+    );
+
+    for (const img of items) {
+      if (!img) { failed++; continue; }
+      try {
+        await addImage(db, img);
+        migrated++;
+      } catch (e) {
+        // 可能已存在（幂等）
+        if (e.message?.includes("UNIQUE constraint")) {
+          console.log(`Skip existing: ${img.id}`);
+        } else {
+          console.error(`Failed to migrate ${img.id}:`, e.message);
+          failed++;
+        }
+      }
+    }
   }
 
-  // 写 manifest
-  await saveManifest(bucket, manifest);
-
-  // 删除旧索引
-  await bucket.delete("_meta/index.json");
-
-  return { migrated: images.length };
+  return {
+    migrated,
+    failed,
+    total_in_manifest: ids.length,
+    message: `Migrated ${migrated} images, ${failed} failed`,
+  };
 }

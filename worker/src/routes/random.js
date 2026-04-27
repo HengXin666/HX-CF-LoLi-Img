@@ -1,25 +1,15 @@
 import { json, error, getMime } from "../utils.js";
-import {
-  loadManifest,
-  loadItem,
-  loadItems,
-  queryIds,
-  queryWithDimensions,
-  pickRandomIds,
-} from "../meta.js";
+import { queryRandom, queryCount, loadItem, loadItems } from "../meta.js";
 
 /**
  * GET /api/random
  *
- * 性能:
- *   无筛选 → 读 manifest(几KB) + N 个 item(各~300B) → CPU < 3ms
- *   tag 筛选 → manifest 倒排索引取交集 → O(1) 无需遍历
- *   尺寸筛选 → 需按需加载 item 详情，但先用索引大幅缩小候选集
+ * 性能: 单次 D1 SQL 查询，利用索引
+ *   无筛选 → ORDER BY RANDOM() LIMIT N → ~1ms
+ *   tag 筛选 → JOIN image_tags + HAVING → ~2ms
+ *   尺寸筛选 → WHERE width >= ? → 索引命中
  */
 export async function handleRandom(request, env, url) {
-  const manifest = await loadManifest(env.BUCKET);
-
-  // 解析筛选条件
   const tags = url.searchParams.getAll("tag").map((t) => t.trim().toLowerCase()).filter(Boolean);
   const orientation = url.searchParams.get("orientation") || "";
   const minWidth = parseInt(url.searchParams.get("min_width")) || 0;
@@ -39,32 +29,15 @@ export async function handleRandom(request, env, url) {
   if (maxHeight) filter.maxHeight = maxHeight;
   if (hasPromptParam !== null) filter.hasPrompt = hasPromptParam === "true";
 
-  // 第一步：用 manifest 索引快速筛选 ID（O(1) 级别，无 IO）
-  let candidateIds = queryIds(manifest, filter);
-  if (candidateIds.length === 0) {
+  // 单次 D1 查询完成筛选 + 随机
+  const pickedIds = await queryRandom(env.DB, filter, count);
+  if (pickedIds.length === 0) {
     return error("No images match the given filters", 404);
   }
 
-  // 第二步：如果有尺寸筛选，按需加载 item 详情再过滤
-  const hasDimFilter = minWidth || minHeight || maxWidth || maxHeight;
-  if (hasDimFilter) {
-    // 尺寸过滤前先随机采样，避免全量加载
-    // 策略：取 count * 10 个候选，加载详情后再筛选
-    const sampleSize = Math.min(candidateIds.length, count * 10);
-    const sampled = pickRandomIds(candidateIds, sampleSize);
-    candidateIds = await queryWithDimensions(env.BUCKET, sampled, filter);
-    if (candidateIds.length === 0) {
-      return error("No images match the given size filters", 404);
-    }
-  }
+  const picked = await loadItems(env.DB, pickedIds);
+  const totalMatched = await queryCount(env.DB, filter);
 
-  // 第三步：随机选取
-  const pickedIds = pickRandomIds(candidateIds, count);
-
-  // 第四步：批量加载选中图片的详情
-  const picked = await loadItems(env.BUCKET, pickedIds);
-
-  // 构造响应
   const baseUrl = `${url.protocol}//${url.host}`;
   const withUrls = picked.map((img) => ({
     id: img.id,
@@ -104,17 +77,17 @@ export async function handleRandom(request, env, url) {
 
   return json({
     count: withUrls.length,
-    total_matched: candidateIds.length,
+    total_matched: totalMatched,
     images: withUrls,
   });
 }
 
 /**
- * GET /i/<id> — 直接返回图片 (O(1) 查询)
- * 只读一个 item JSON + 一个图片文件，不碰 manifest
+ * GET /i/<id> — 直接返回图片
+ * 1 次 D1 查询 + 1 次 R2 读取
  */
 export async function handleImage(request, env, url, id) {
-  const img = await loadItem(env.BUCKET, id);
+  const img = await loadItem(env.DB, id);
   if (!img) return error("Not found", 404);
 
   const obj = await env.BUCKET.get(img.key);

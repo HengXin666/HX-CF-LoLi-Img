@@ -3,10 +3,16 @@ name = "hx-loli-img"
 main = "worker/src/index.js"
 compatibility_date = "2024-12-01"
 
-# R2 Binding
+# R2 Binding（图片文件存储）
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "loli-img"
+
+# D1 Binding（元数据数据库）
+[[d1_databases]]
+binding = "DB"
+database_name = "loli-img-db"
+database_id = "ce3a46b0-2166-4ae0-8163-0790014fc7a9" # 部署脚本会自动填充
 
 # 开发环境变量在 .dev.vars 中配置（不提交到 git）
 # 生产环境变量在 Cloudflare Dashboard 中配置
@@ -14,3 +20,8 @@ bucket_name = "loli-img"
 # 需要配置的变量:
 # ADMIN_TOKEN - 管理员 API 密钥
 # UPLOAD_TOKEN - 上传 API 密钥
+
+# 自定义域名
+routes = [
+  { pattern = "img.woa.qzz.io/*", zone_name = "qzz.io" }
+]

@@ -1,13 +1,14 @@
 import { checkAuth, error, json } from "../utils.js";
 import {
-  loadManifest,
   loadItem,
   loadItems,
-  loadShardPage,
   deleteImage,
   deleteImages,
   updateImage,
-  migrateV1toV2,
+  queryList,
+  listTags,
+  getStats,
+  migrateR2toD1,
 } from "../meta.js";
 
 function requireAdmin(request, env) {
@@ -21,97 +22,44 @@ function requireAdmin(request, env) {
  * GET /api/admin/images
  * 查询参数: page, per_page, tag, orientation, search
  *
- * 性能: 只读 manifest + 1 个 shard（分页）
- * 搜索时需加载候选 items 详情
+ * 性能: 单次 D1 查询 + 分页
  */
 export async function handleListImages(request, env, url) {
   const authErr = requireAdmin(request, env);
   if (authErr) return authErr;
 
-  const manifest = await loadManifest(env.BUCKET);
   const page = Math.max(parseInt(url.searchParams.get("page")) || 1, 1);
   const perPage = Math.min(Math.max(parseInt(url.searchParams.get("per_page")) || 20, 1), 100);
   const tag = url.searchParams.get("tag");
   const orientation = url.searchParams.get("orientation");
   const search = url.searchParams.get("search");
 
-  // 先用 manifest 索引缩小候选集
-  let candidateIds = [...manifest.ids];
-
-  if (tag) {
-    const tagIds = new Set(manifest.by_tag[tag.toLowerCase()] || []);
-    candidateIds = candidateIds.filter((id) => tagIds.has(id));
-  }
-  if (orientation) {
-    const orientIds = new Set(manifest.by_orientation[orientation] || []);
-    candidateIds = candidateIds.filter((id) => orientIds.has(id));
-  }
-
-  // 倒序（最新在前）— ids 是按添加顺序排的
-  candidateIds.reverse();
-
-  // 搜索需要加载详情
-  if (search) {
-    const q = search.toLowerCase();
-    // 加载所有候选 items 进行搜索（搜索是管理操作，可以容忍更长时间）
-    const allItems = await loadItems(env.BUCKET, candidateIds);
-    const filtered = allItems.filter(
-      (img) =>
-        (img.tags && img.tags.some((t) => t.includes(q))) ||
-        (img.source && img.source.toLowerCase().includes(q)) ||
-        (img.uploader && img.uploader.toLowerCase().includes(q)) ||
-        img.id.includes(q)
-    );
-    const total = filtered.length;
-    const start = (page - 1) * perPage;
-    const paged = filtered.slice(start, start + perPage);
-
-    const baseUrl = `${url.protocol}//${url.host}`;
-    const withUrls = paged.map((img) => ({
-      ...img,
-      url: `${baseUrl}/i/${img.id}`,
-      thumb_url: `${baseUrl}/i/${img.id}`,
-    }));
-
-    return json({
-      total,
-      page,
-      per_page: perPage,
-      total_pages: Math.ceil(total / perPage),
-      images: withUrls,
-    });
-  }
-
-  // 无搜索：直接分页 ID，再加载该页的 items
-  const total = candidateIds.length;
-  const start = (page - 1) * perPage;
-  const pagedIds = candidateIds.slice(start, start + perPage);
-  const pagedItems = await loadItems(env.BUCKET, pagedIds);
+  const result = await queryList(env.DB, { page, perPage, tag, orientation, search });
 
   const baseUrl = `${url.protocol}//${url.host}`;
-  const withUrls = pagedItems.map((img) => ({
+  const withUrls = result.images.map((img) => ({
     ...img,
     url: `${baseUrl}/i/${img.id}`,
     thumb_url: `${baseUrl}/i/${img.id}`,
   }));
 
   return json({
-    total,
-    page,
-    per_page: perPage,
-    total_pages: Math.ceil(total / perPage),
+    total: result.total,
+    page: result.page,
+    per_page: result.perPage,
+    total_pages: Math.ceil(result.total / result.perPage),
     images: withUrls,
   });
 }
 
 /**
- * GET /api/admin/image/:id  — O(1) 查询
+ * GET /api/admin/image/:id
  */
 export async function handleGetImage(request, env, url, id) {
   const authErr = requireAdmin(request, env);
   if (authErr) return authErr;
 
-  const img = await loadItem(env.BUCKET, id);
+  const img = await loadItem(env.DB, id);
   if (!img) return error("Not found", 404);
 
   const baseUrl = `${url.protocol}//${url.host}`;
@@ -126,7 +74,7 @@ export async function handleUpdateImage(request, env, url, id) {
   if (authErr) return authErr;
 
   const updates = await request.json();
-  const img = await updateImage(env.BUCKET, id, updates);
+  const img = await updateImage(env.DB, id, updates);
   if (!img) return error("Not found", 404);
 
   const baseUrl = `${url.protocol}//${url.host}`;
@@ -140,8 +88,12 @@ export async function handleDeleteImage(request, env, url, id) {
   const authErr = requireAdmin(request, env);
   if (authErr) return authErr;
 
-  const img = await deleteImage(env.BUCKET, id);
+  const img = await deleteImage(env.DB, id);
   if (!img) return error("Not found", 404);
+
+  // 删除 R2 图片文件
+  await env.BUCKET.delete(img.key);
+
   return json({ ok: true, deleted: img });
 }
 
@@ -157,55 +109,48 @@ export async function handleBatchDelete(request, env) {
     return error("Missing ids array");
   }
 
-  const deleted = await deleteImages(env.BUCKET, body.ids);
+  const deleted = await deleteImages(env.DB, body.ids);
+
+  // 批量删除 R2 图片文件
+  const r2Keys = deleted.map((img) => img.key).filter(Boolean);
+  if (r2Keys.length > 0) {
+    for (let i = 0; i < r2Keys.length; i += 1000) {
+      await env.BUCKET.delete(r2Keys.slice(i, i + 1000));
+    }
+  }
+
   return json({ ok: true, deleted_count: deleted.length });
 }
 
 /**
- * GET /api/admin/tags — 直接从 manifest 读取，O(1)
+ * GET /api/admin/tags
  */
 export async function handleListTags(request, env) {
   const authErr = requireAdmin(request, env);
   if (authErr) return authErr;
 
-  const manifest = await loadManifest(env.BUCKET);
-  const tags = Object.entries(manifest.by_tag)
-    .map(([name, ids]) => ({ name, count: ids.length }))
-    .sort((a, b) => b.count - a.count);
-
+  const tags = await listTags(env.DB);
   return json({ tags });
 }
 
 /**
- * GET /api/admin/stats — 直接从 manifest 计算，O(1)
+ * GET /api/admin/stats
  */
 export async function handleStats(request, env) {
   const authErr = requireAdmin(request, env);
   if (authErr) return authErr;
 
-  const manifest = await loadManifest(env.BUCKET);
-
-  return json({
-    total_images: manifest.total,
-    orientations: {
-      landscape: manifest.by_orientation.landscape.length,
-      portrait: manifest.by_orientation.portrait.length,
-      square: manifest.by_orientation.square.length,
-      unknown: manifest.by_orientation.unknown.length,
-    },
-    with_prompt: manifest.with_prompt.length,
-    unique_tags: Object.keys(manifest.by_tag).length,
-    updated_at: manifest.updated_at,
-  });
+  const stats = await getStats(env.DB);
+  return json(stats);
 }
 
 /**
- * POST /api/admin/migrate — 从 v1 迁移到 v2
+ * POST /api/admin/migrate — 从 R2 旧元数据迁移到 D1
  */
 export async function handleMigrate(request, env) {
   const authErr = requireAdmin(request, env);
   if (authErr) return authErr;
 
-  const result = await migrateV1toV2(env.BUCKET);
+  const result = await migrateR2toD1(env.BUCKET, env.DB);
   return json({ ok: true, ...result });
 }

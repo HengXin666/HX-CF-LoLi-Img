@@ -11,6 +11,7 @@ import {
   handleStats,
   handleMigrate,
 } from "./routes/admin.js";
+import { initDB } from "./meta.js";
 import { ADMIN_HTML } from "./admin-ui.js";
 
 export default {
@@ -44,6 +45,16 @@ export default {
       }
       if (path === "/api/upload/batch" && method === "POST") {
         return handleBatchRegister(request, env);
+      }
+
+      // D1 数据库初始化（幂等，POST /api/admin/init-db）
+      if (path === "/api/admin/init-db" && method === "POST") {
+        const auth = request.headers.get("Authorization");
+        if (!auth || auth !== `Bearer ${env.ADMIN_TOKEN}`) {
+          return error("Unauthorized", 401);
+        }
+        await initDB(env.DB);
+        return json({ ok: true, message: "Database initialized" });
       }
 
       // ===== 管理 API（需要 ADMIN_TOKEN） =====
