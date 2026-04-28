@@ -3,11 +3,6 @@ name = "hx-loli-img"
 main = "worker/src/index.js"
 compatibility_date = "2024-12-01"
 
-# 自定义域名
-routes = [
-  { pattern = "img.woa.qzz.io/*", zone_name = "qzz.io" }
-]
-
 # R2 Binding（图片文件存储）
 [[r2_buckets]]
 binding = "BUCKET"
