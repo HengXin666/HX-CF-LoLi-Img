@@ -1,6 +1,6 @@
 {
   "name": "hx-loli-img",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "二次元随机图片 API - Cloudflare R2 + Workers",
   "scripts": {

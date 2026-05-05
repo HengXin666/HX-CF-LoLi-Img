@@ -13,10 +13,10 @@ import { addImage } from "../meta.js";
  *   width     - 图片宽度（可选，不传则不记录）
  *   height    - 图片高度（可选，不传则不记录）
  *
- * 鉴权: Bearer <UPLOAD_TOKEN>
+ * 鉴权: Bearer <ADMIN_TOKEN>
  */
 export async function handleUpload(request, env) {
-  if (!checkAuth(request, env.UPLOAD_TOKEN)) {
+  if (!checkAuth(request, env.ADMIN_TOKEN)) {
     return error("Unauthorized", 401);
   }
 
@@ -105,7 +105,7 @@ export async function handleUpload(request, env) {
  * 用于批量注册已通过 S3 API 上传到 R2 的图片
  */
 export async function handleBatchRegister(request, env) {
-  if (!checkAuth(request, env.UPLOAD_TOKEN)) {
+  if (!checkAuth(request, env.ADMIN_TOKEN)) {
     return error("Unauthorized", 401);
   }
 

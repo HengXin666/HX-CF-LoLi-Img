@@ -39,7 +39,7 @@ export default {
         return handleImage(request, env, url, imageMatch[1]);
       }
 
-      // ===== 上传 API（需要 UPLOAD_TOKEN） =====
+      // ===== 上传 API（需要 ADMIN_TOKEN） =====
       if (path === "/api/upload" && method === "POST") {
         return handleUpload(request, env);
       }
@@ -100,7 +100,10 @@ export default {
       return error("Not Found", 404);
     } catch (e) {
       console.error("Unhandled error:", e);
-      return error(`Internal Server Error: ${e.message}`, 500);
+      return new Response(JSON.stringify({ error: `Internal Server Error: ${e.message}` }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
     }
   },
 };

@@ -220,47 +220,36 @@ def step_check_deps() -> bool:
     return has_gh
 
 
-def step_secrets(project_root: Path) -> tuple[str, str]:
+def step_secrets(project_root: Path) -> str:
     """Step 2: 配置密钥（幂等：已有则复用）"""
     step(2, "Configure secrets")
 
     dev_vars = project_root / ".dev.vars"
     existing = read_dev_vars(dev_vars)
     admin_token = existing.get("ADMIN_TOKEN", "")
-    upload_token = existing.get("UPLOAD_TOKEN", "")
 
-    if admin_token and upload_token:
-        print(f"  {green('[ok]')} Secrets already configured in .dev.vars")
+    if admin_token:
+        print(f"  {green('[ok]')} Secret already configured in .dev.vars")
         print(f"  Admin Token:  {admin_token[:12]}...")
-        print(f"  Upload Token: {upload_token[:12]}...")
-        if ask_yes("Regenerate secrets?", default=False):
+        if ask_yes("Regenerate secret?", default=False):
             admin_token = generate_token()
-            upload_token = generate_token()
         else:
-            return admin_token, upload_token
+            return admin_token
 
     if not admin_token:
         admin_token = generate_token()
-    if not upload_token:
-        upload_token = generate_token()
 
     dev_vars.write_text(
-        f"# Auto-generated -- DO NOT commit to Git!\n"
-        f"ADMIN_TOKEN={admin_token}\n"
-        f"UPLOAD_TOKEN={upload_token}\n",
+        f"# Auto-generated -- DO NOT commit to Git!\n" f"ADMIN_TOKEN={admin_token}\n",
         encoding="utf-8",
     )
     print(
         f"\n  {green('Admin Token')}:  {admin_token[:12]}... {dim('(saved to .dev.vars)')}"
     )
-    print(
-        f"  {green('Upload Token')}: {upload_token[:12]}... {dim('(saved to .dev.vars)')}"
-    )
-    print(f"\n  {yellow('!! Remember these tokens !!')}")
-    print(f"  {yellow('  Admin Token  -> /admin dashboard')}")
-    print(f"  {yellow('  Upload Token -> Python uploader')}")
+    print(f"\n  {yellow('!! Remember this token !!')}")
+    print(f"  {yellow('  Admin Token  -> /admin dashboard & upload API')}")
 
-    return admin_token, upload_token
+    return admin_token
 
 
 def step_npm(project_root: Path):
@@ -332,7 +321,7 @@ def step_git_github(project_root: Path, has_gh: bool):
         print(dim("  Skipping GitHub setup"))
 
 
-def step_cloudflare(project_root: Path, admin_token: str, upload_token: str) -> str:
+def step_cloudflare(project_root: Path, admin_token: str) -> str:
     """Step 5: Cloudflare R2 + Worker secrets（幂等：bucket 已存在则跳过）
     返回 bucket_name。
     """
@@ -397,7 +386,7 @@ def step_cloudflare(project_root: Path, admin_token: str, upload_token: str) -> 
 
     # 设置 Worker secrets（幂等：wrangler secret put 是覆盖式的）
     print(f"\n  Setting Worker production secrets...")
-    for name, value in [("ADMIN_TOKEN", admin_token), ("UPLOAD_TOKEN", upload_token)]:
+    for name, value in [("ADMIN_TOKEN", admin_token)]:
         if not value:
             continue
         print(dim(f"  Setting {name}..."))
@@ -700,9 +689,7 @@ def step_github_actions(project_root: Path, has_gh: bool):
         )
 
 
-def print_summary(
-    worker_url: str, admin_token: str, upload_token: str, project_root: Path
-):
+def print_summary(worker_url: str, admin_token: str, project_root: Path):
     """打印部署完成后的完整指引。"""
     print()
     print(pink("  +==========================================+"))
@@ -746,16 +733,15 @@ def print_summary(
     print(f"  Random (tag):  {base_url}/api/random?tag=genshin")
     print()
 
-    print(f"  {bold('Secrets (save these!):')}")
+    print(f"  {bold('Secrets (save this!):')}")
     print(f"  Admin Token:   {admin_token}")
-    print(f"  Upload Token:  {upload_token}")
     print()
 
     print(f"  {bold('Upload images with Python SDK:')}")
     print(dim("  cd sdk/python && uv sync"))
     print()
     print(dim("    from hx_loli_img import LoLiImgClient"))
-    print(dim(f'    client = LoLiImgClient("{base_url}", "{upload_token[:8]}...")'))
+    print(dim(f'    client = LoLiImgClient("{base_url}", "{admin_token[:8]}...")'))
     print(dim('    client.upload("image.jpg", tags=["genshin", "hutao"])'))
     print()
 
@@ -786,7 +772,7 @@ def main():
     has_gh = step_check_deps()
 
     # Step 2: 配置密钥
-    admin_token, upload_token = step_secrets(project_root)
+    admin_token = step_secrets(project_root)
 
     # Step 3: 安装 npm 依赖
     step_npm(project_root)
@@ -795,7 +781,7 @@ def main():
     step_git_github(project_root, has_gh)
 
     # Step 5: Cloudflare R2 + Worker secrets
-    step_cloudflare(project_root, admin_token, upload_token)
+    step_cloudflare(project_root, admin_token)
 
     # Step 6: D1 数据库
     step_d1(project_root)
@@ -837,7 +823,7 @@ def main():
     step_github_actions(project_root, has_gh)
 
     # 完成总结
-    print_summary(worker_url, admin_token, upload_token, project_root)
+    print_summary(worker_url, admin_token, project_root)
 
 
 if __name__ == "__main__":

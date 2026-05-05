@@ -377,11 +377,12 @@ export async function listTags(db) {
  * 获取统计信息
  */
 export async function getStats(db) {
-  const [totalResult, orientResult, promptResult, tagResult] = await db.batch([
+  const [totalResult, orientResult, promptResult, tagResult, sizeResult] = await db.batch([
     db.prepare("SELECT COUNT(*) as cnt FROM images"),
     db.prepare("SELECT orientation, COUNT(*) as cnt FROM images GROUP BY orientation"),
     db.prepare("SELECT COUNT(*) as cnt FROM images WHERE prompt IS NOT NULL"),
     db.prepare("SELECT COUNT(DISTINCT tag) as cnt FROM image_tags"),
+    db.prepare("SELECT COALESCE(SUM(size), 0) as total_size FROM images"),
   ]);
 
   const orientations = { landscape: 0, portrait: 0, square: 0, unknown: 0 };
@@ -393,6 +394,7 @@ export async function getStats(db) {
 
   return {
     total_images: totalResult.results[0]?.cnt || 0,
+    total_size_mb: ((sizeResult.results[0]?.total_size || 0) / (1024 * 1024)).toFixed(1),
     orientations,
     with_prompt: promptResult.results[0]?.cnt || 0,
     unique_tags: tagResult.results[0]?.cnt || 0,

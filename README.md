@@ -178,7 +178,6 @@ cp .dev.vars.example .dev.vars
 
 ```bash
 npx wrangler secret put ADMIN_TOKEN
-npx wrangler secret put UPLOAD_TOKEN
 ```
 
 **5. 安装依赖并部署**
@@ -280,7 +279,7 @@ GET /i/{image_id}?dl    # 触发下载
 
 ```
 POST /api/upload
-Authorization: Bearer <UPLOAD_TOKEN>
+Authorization: Bearer <ADMIN_TOKEN>
 Content-Type: multipart/form-data
 ```
 
@@ -298,7 +297,7 @@ Content-Type: multipart/form-data
 
 ```
 POST /api/upload/batch
-Authorization: Bearer <UPLOAD_TOKEN>
+Authorization: Bearer <ADMIN_TOKEN>
 Content-Type: application/json
 ```
 

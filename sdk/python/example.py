@@ -11,11 +11,11 @@ from hx_loli_img import LoLiImgClient
 
 
 def main():
-    # 配置你的 Worker URL 和上传 Token
+    # 配置你的 Worker URL 和管理 Token
     BASE_URL = "https://your-worker.your-domain.com"
-    UPLOAD_TOKEN = "your-upload-token"
+    ADMIN_TOKEN = "your-admin-token"
 
-    with LoLiImgClient(BASE_URL, UPLOAD_TOKEN) as client:
+    with LoLiImgClient(BASE_URL, ADMIN_TOKEN) as client:
         # === 上传图片 ===
         result = client.upload(
             "path/to/image.jpg",

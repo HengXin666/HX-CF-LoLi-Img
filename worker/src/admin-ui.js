@@ -481,8 +481,8 @@ async function doUpload() {
       // 尝试用 Image 获取尺寸
       const dim = await getImageDimensions(f);
       if (dim) { fd.append("width", dim.width); fd.append("height", dim.height); }
-      await fetch(API + "/api/upload", { method: "POST", headers: { Authorization: "Bearer " + token }, body: fd });
-      ok++;
+      const res = await fetch(API + "/api/upload", { method: "POST", headers: { Authorization: "Bearer " + token }, body: fd });
+      if (res.ok) { ok++; } else { fail++; console.error("Upload failed:", res.status, await res.text().catch(() => "")); }
     } catch { fail++; }
   }
 

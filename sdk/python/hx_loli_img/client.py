@@ -17,7 +17,7 @@ class LoLiImgClient:
     """图片上传客户端。
 
     用法:
-        client = LoLiImgClient("https://your-worker.dev", "your-upload-token")
+        client = LoLiImgClient("https://your-worker.dev", "your-admin-token")
         result = client.upload("path/to/image.jpg", tags=["genshin", "hutao"])
     """
 
@@ -105,9 +105,7 @@ class LoLiImgClient:
         """
         results = []
         for fp in file_paths:
-            result = self.upload(
-                fp, tags=tags, source=source, uploader=uploader
-            )
+            result = self.upload(fp, tags=tags, source=source, uploader=uploader)
             results.append(result)
         return results
 
@@ -120,7 +118,7 @@ class LoLiImgClient:
         min_width: int | None = None,
         min_height: int | None = None,
     ) -> dict:
-        """获取随机图片（公开 API，不需要上传 Token）。
+        """获取随机图片（公开 API，不需要 Token）。
 
         Args:
             count: 返回数量 (1-20)

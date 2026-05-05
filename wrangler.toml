@@ -18,5 +18,4 @@ database_id = "ce3a46b0-2166-4ae0-8163-0790014fc7a9"
 # 生产环境变量在 Cloudflare Dashboard 中配置
 #
 # 需要配置的变量:
-# ADMIN_TOKEN - 管理员 API 密钥
-# UPLOAD_TOKEN - 上传 API 密钥
+# ADMIN_TOKEN - 管理 API 密钥（同时用于上传和管理）
