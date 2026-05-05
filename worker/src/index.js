@@ -14,6 +14,21 @@ import {
 import { initDB } from "./meta.js";
 import { ADMIN_HTML } from "./admin-ui.js";
 
+let dbInitialized = false;
+
+// 包装处理函数：捕获 DB 错误时自动初始化并重试一次
+async function withAutoInit(handler, request, env, ...args) {
+  try {
+    return await handler(request, env, ...args);
+  } catch (e) {
+    if (!dbInitialized && e.message && (e.message.includes("no such table") || e.message.includes("SQLITE_ERROR"))) {
+      try { await initDB(env.DB); dbInitialized = true; } catch {}
+      return await handler(request, env, ...args);
+    }
+    throw e;
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     // CORS preflight
@@ -30,21 +45,21 @@ export default {
 
       // 随机图片 API
       if (path === "/api/random" && method === "GET") {
-        return handleRandom(request, env, url);
+        return await withAutoInit(handleRandom, request, env, url);
       }
 
       // 直接访问图片 /i/<id>
       const imageMatch = path.match(/^\/i\/([a-z0-9]+)$/);
       if (imageMatch && method === "GET") {
-        return handleImage(request, env, url, imageMatch[1]);
+        return await withAutoInit(handleImage, request, env, url, imageMatch[1]);
       }
 
       // ===== 上传 API（需要 ADMIN_TOKEN） =====
       if (path === "/api/upload" && method === "POST") {
-        return handleUpload(request, env);
+        return await withAutoInit(handleUpload, request, env);
       }
       if (path === "/api/upload/batch" && method === "POST") {
-        return handleBatchRegister(request, env);
+        return await withAutoInit(handleBatchRegister, request, env);
       }
 
       // D1 数据库初始化（幂等，POST /api/admin/init-db）
@@ -54,33 +69,34 @@ export default {
           return error("Unauthorized", 401);
         }
         await initDB(env.DB);
+        dbInitialized = true;
         return json({ ok: true, message: "Database initialized" });
       }
 
       // ===== 管理 API（需要 ADMIN_TOKEN） =====
       if (path === "/api/admin/images" && method === "GET") {
-        return handleListImages(request, env, url);
+        return await withAutoInit(handleListImages, request, env, url);
       }
       if (path === "/api/admin/tags" && method === "GET") {
-        return handleListTags(request, env);
+        return await withAutoInit(handleListTags, request, env);
       }
       if (path === "/api/admin/stats" && method === "GET") {
-        return handleStats(request, env);
+        return await withAutoInit(handleStats, request, env);
       }
       if (path === "/api/admin/batch-delete" && method === "POST") {
-        return handleBatchDelete(request, env);
+        return await withAutoInit(handleBatchDelete, request, env);
       }
       if (path === "/api/admin/migrate" && method === "POST") {
-        return handleMigrate(request, env);
+        return await withAutoInit(handleMigrate, request, env);
       }
 
       // /api/admin/image/:id
       const adminImageMatch = path.match(/^\/api\/admin\/image\/([a-z0-9]+)$/);
       if (adminImageMatch) {
         const id = adminImageMatch[1];
-        if (method === "GET") return handleGetImage(request, env, url, id);
-        if (method === "PUT") return handleUpdateImage(request, env, url, id);
-        if (method === "DELETE") return handleDeleteImage(request, env, url, id);
+        if (method === "GET") return await withAutoInit(handleGetImage, request, env, url, id);
+        if (method === "PUT") return await withAutoInit(handleUpdateImage, request, env, url, id);
+        if (method === "DELETE") return await withAutoInit(handleDeleteImage, request, env, url, id);
       }
 
       // ===== 管理前端 =====

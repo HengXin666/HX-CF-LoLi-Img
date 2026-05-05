@@ -50,12 +50,25 @@ CREATE INDEX IF NOT EXISTS idx_images_created_at ON images(created_at);
  * 初始化数据库表（幂等，可重复调用）
  */
 export async function initDB(db) {
-  const statements = SCHEMA_SQL
-    .split(";")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  for (const sql of statements) {
-    await db.prepare(sql).run();
+  try {
+    // D1 的 exec() 方法支持一次执行多条 DDL，且自动忽略已存在的对象
+    await db.exec(SCHEMA_SQL);
+  } catch (e) {
+    // exec 失败时回退到逐条执行
+    const statements = SCHEMA_SQL
+      .split(";")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const sql of statements) {
+      try {
+        await db.prepare(sql).run();
+      } catch (inner) {
+        // CREATE IF NOT EXISTS 幂等，忽略已存在错误
+        if (!inner.message?.includes("already exists")) {
+          console.error("initDB statement failed:", sql, inner.message);
+        }
+      }
+    }
   }
 }
 

@@ -258,6 +258,11 @@ async function api(path, opts = {}) {
     headers: { Authorization: "Bearer " + token, ...(opts.headers || {}) },
   });
   if (res.status === 401) { logout(); throw new Error("Unauthorized"); }
+  if (!res.ok) {
+    let msg = \`请求失败 (\${res.status})\`;
+    try { const body = await res.json(); if (body.error) msg = body.error; } catch {}
+    throw new Error(msg);
+  }
   return res.json();
 }
 
@@ -278,7 +283,7 @@ async function loadStats() {
       <div class="stat-card"><div class="num">\${d.orientations.landscape}</div><div class="label">横向</div></div>
       <div class="stat-card"><div class="num">\${d.orientations.portrait}</div><div class="label">竖向</div></div>
     \`;
-  } catch (e) { console.error(e); }
+  } catch (e) { console.error(e); document.getElementById("statsGrid").innerHTML = \`<div class="stat-card" style="grid-column:1/-1"><div class="num">⚠️</div><div class="label">统计加载失败: \${e.message}</div></div>\`; }
 }
 
 // === 标签 ===
@@ -307,7 +312,7 @@ async function loadImages() {
     renderImages(d);
     renderPagination(d);
   } catch (e) {
-    document.getElementById("imageGrid").innerHTML = '<div class="empty"><div class="icon">😿</div><p>加载失败，请检查 Token</p></div>';
+    document.getElementById("imageGrid").innerHTML = \`<div class="empty"><div class="icon">😿</div><p>加载失败: \${e.message}</p></div>\`;
   }
 }
 
